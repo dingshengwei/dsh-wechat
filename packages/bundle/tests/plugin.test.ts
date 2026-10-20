@@ -2202,6 +2202,32 @@ test('a quoted spoken listing answers with the rows that message printed', async
     try {
       await harness.runtime.ingest(inbound('第一条'))
 
+      /*
+       * Pick a number the first screen never printed, for the offset assertion below.
+       *
+       * A numeric target that misses the pinned screen falls through to the ordinary id/title
+       * match in `resolveTarget`. If the session this first message just created happens to have a
+       * short id starting with the number, that switch really succeeds — the same 1/256 flake the
+       * handbook records for `/switch 99`. So choose a number no live id can match instead of
+       * betting on the random session id.
+       */
+      const liveIds = [
+        ...ids,
+        ...harness.created.flatMap((entry) =>
+          entry.sessionId === undefined ? [] : [entry.sessionId],
+        ),
+        ...harness.prompted.map((entry) => entry.sessionId),
+      ]
+      const idKeys = liveIds.map((id) =>
+        (/^session-([0-9a-f]+)-/i.exec(id)?.[1] ?? id).toLowerCase(),
+      )
+      const unprinted = Array.from({ length: 86 }, (_, index) => index + 14).find(
+        (candidate) =>
+          !idKeys.some((key) => key.startsWith(String(candidate))) &&
+          !liveIds.some((id) => id.toLowerCase().endsWith(String(candidate))),
+      )
+      assert.ok(unprinted !== undefined, 'a number no live session id can match')
+
       const listed = await control(harness, 'list')
       assert.equal(listed.ok, true, listed.detail)
       const pageOne = harness.sent.at(-1)?.text ?? ''
@@ -2222,16 +2248,16 @@ test('a quoted spoken listing answers with the rows that message printed', async
       assert.match(harness.sent.at(-1)?.text ?? '', /已切换到「本工作区 0」/)
       assert.equal((await harness.runtime.bindings())[0]?.sessionId, oldest)
 
-      // And the first screen, which never printed 14, does not answer it: the offset is what makes
-      // the same text mean the row on the screen it was typed against. Row 1 is a different
-      // conversation, so "nothing moved" is a real assertion rather than the binding already being
-      // the one under test.
+      // And the first screen, which never printed that number, does not answer it: the offset is
+      // what makes the same text mean the row on the screen it was typed against. Row 1 is a
+      // different conversation, so "nothing moved" is a real assertion rather than the binding
+      // already being the one under test.
       await harness.runtime.ingest(quoting('/switch 1', pageOneId))
       const afterFirst = (await harness.runtime.bindings())[0]?.sessionId
       assert.ok(afterFirst)
       assert.notEqual(afterFirst, oldest, 'row 1 of the first screen is a different conversation')
 
-      await harness.runtime.ingest(quoting('/switch 14', pageOneId))
+      await harness.runtime.ingest(quoting(`/switch ${String(unprinted)}`, pageOneId))
       assert.match(harness.sent.at(-1)?.text ?? '', /找不到这个对话/)
       assert.equal(
         (await harness.runtime.bindings())[0]?.sessionId,
@@ -2581,8 +2607,9 @@ test('the confirmation policy travels in the tool description and follows the se
     // And it is told not to claim an outcome itself. The log shows why: the tool returned
     // `ok: false` and the agent told the user the switch had worked, which the user only discovered
     // when their next message landed in the conversation they thought they had left.
-    assert.match(description, /Never tell the user a switch or a new conversation succeeded/)
-    assert.match(description, /including when they fail/)
+    assert.match(description, /do not repeat it or claim success/)
+    assert.match(description, /failures included/)
+    assert.match(description, /say nothing if `ok` is false/)
   })
 
   await withSettings(
@@ -2704,11 +2731,66 @@ test('the model tool offers the actions a user can ask for, levels included', as
     // A level asked for in words has to reach this tool too, or "调高一点" is answered with prose.
     assert.match(tool.description, /推理等级/)
     assert.match(tool.description, /thinking level/)
-    assert.match(tool.description, /Never tell the user a model or level switch succeeded/)
+    assert.match(tool.description, /never claim a model\/level switch succeeded/)
+    assert.match(tool.description, /say nothing if `ok` is false/)
+    assert.match(tool.description, /from the next turn/)
     // The level is its own parameter, documented for both actions that take one.
     const level = (properties as Record<string, { description?: string }>).level
     assert.match(level?.description ?? '', /Required for set_level/)
     assert.match(level?.description ?? '', /switch it is optional/)
+  })
+})
+
+/*
+ * The two rules in `notify_wechat`'s description that no code can enforce for the agent.
+ *
+ * Nothing in the tool refuses a burst of ten separate messages: the service accepts them until the
+ * window closes, and then the eleventh is refused. The ten-message rule reaches the model only
+ * through this text. Likewise, a script that opens its own iLink client bypasses the ledger the
+ * plugin and `dsh-wechat-send` share — the plugin cannot count, warn about, or queue a send it
+ * never sees. These assertions are the guard against "shortening" either rule out of existence.
+ */
+test('the notify_wechat description keeps the ten-message window and the script route', async () => {
+  await withHarness(async (harness) => {
+    const description = notifyTool(harness).description
+
+    assert.match(description, /ten messages/)
+    assert.match(description, /reply window/)
+    assert.match(description, /reopens only when the user writes/)
+    assert.match(description, /one message, not several/)
+
+    assert.match(description, /dsh-wechat-send/)
+    assert.match(description, /never the iLink API/)
+    assert.match(description, /count, warn and queue/)
+    assert.match(description, /direct calls lose messages/)
+  })
+})
+
+/*
+ * The channel's own announcement is the only message that reaches the chat after a switch.
+ *
+ * An agent summary on top of it is noise at best. At worst it contradicts the channel: on a failed
+ * switch the tool returns `ok: false` while the agent, reading only its own intention, tells the
+ * user the move worked. Both descriptions therefore have to say it: the channel announced it, do
+ * not repeat it, never claim success, and stay silent when `ok` is false.
+ */
+test('the session and model descriptions keep the channel-announcement rule', async () => {
+  await withSettings(async (harness) => {
+    const session = sessionTool(harness).description
+    assert.match(session, /announces switching\/creating/)
+    assert.match(session, /failures included/)
+    assert.match(session, /do not repeat it or claim success/)
+    assert.match(session, /say nothing if `ok` is false/)
+
+    const model = modelTool(harness).description
+    assert.match(model, /announces listing and switching/)
+    assert.match(model, /failures included/)
+    assert.match(model, /do not repeat it/)
+    assert.match(model, /never claim a model\/level switch succeeded/)
+    assert.match(model, /say nothing if `ok` is false/)
+    // A switch lands on the next turn; claiming it changed the turn already running is the lie this
+    // sentence prevents.
+    assert.match(model, /from the next turn/)
   })
 })
 
@@ -3674,6 +3756,7 @@ async function seedState(home: string, settings: Record<string, unknown>): Promi
 
 /** The `notify_wechat` tool, driven the way the agent would drive it. */
 function notifyTool(harness: Harness): {
+  description: string
   execute(
     args: Record<string, unknown>,
     exec: { agent?: unknown },

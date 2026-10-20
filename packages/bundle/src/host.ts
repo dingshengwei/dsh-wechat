@@ -218,37 +218,28 @@ const BOOT_LOG_NAME = 'boot.log'
  * @returns The description to register.
  */
 export function sessionToolDescription(requireConfirmation: boolean): string {
+  /*
+   * Read by the model on every request, so the words are a recurring cost. The rules below are not
+   * optional, though: each one replaces a failure that happened when it was missing. The channel's
+   * own announcement is the only one that reaches the chat after a switch, and on failure the tool
+   * returns `ok: false` while an agent summary can still claim the move worked. The two list levels
+   * and the continuous numbering are what let the agent talk about the rows the user was sent.
+   */
   const base =
-    'Manage which WeChat conversation (session) this channel is talking to. Call this whenever the ' +
-    'user asks to see their conversations, switch between them, start a new one, find out which ' +
-    'one is in use, or stop what is running — in any wording. Do not merely describe these ' +
-    'actions in a reply; call the tool. The user is on a phone and cannot see the desktop ' +
-    'session list. ' +
-    // The channel announces a move itself, and its words are the only ones that reach the chat
-    // after a switch. An agent summary on top of that is a second, redundant message. The same goes
-    // for a failure, and there it matters more: the log shows the tool returning `ok: false` and the
-    // agent then telling the user the switch had worked.
-    'Switching and creating are announced to the user by the channel — including when they fail — so ' +
-    'do not repeat that outcome either way. Never tell the user a switch or a new conversation ' +
-    'succeeded; read the result\'s `ok` field and, if it is false, say nothing about it because the ' +
-    'channel has already told them what went wrong. ' +
-    // The two levels of the list, because the agent has to be able to say what it just showed: this
-    // workspace's conversations, or the workspaces themselves. A spoken request never types `/list
-    // all`, so the words matter more here than for the typed command.
-    'The list has two levels: action "list" shows this channel\'s own conversations, and target "all" ' +
-    'shows the workspaces on the machine, each with how many conversations it holds. Both are paged ' +
-    'ten rows at a time with numbering that runs on across pages, and the user walks them by replying ' +
-    'to the channel itself — a number, a name, or 「查看其余」 for the next ten — so do not try to ' +
-    'carry that on yourself. Any conversation in any workspace can be switched to, whichever ' +
-    'workspace it is in.'
+    'Manage which WeChat conversation this channel is on. Call this whenever the user asks to ' +
+    'see, switch, create, identify, or stop conversations, however phrased; never just describe it. ' +
+    'The channel announces switching/creating, failures included: do not repeat it or claim ' +
+    'success, and say nothing if `ok` is false. ' +
+    '`list`: this channel\'s conversations; `all`: all workspaces + counts. Both page ' +
+    'ten rows, numbering continuous; the user pages by replying (number, name, 「查看其余」) — not ' +
+    'you. Any workspace\'s conversation can be switched to.'
   if (requireConfirmation) {
     return (
-      `${base} IMPORTANT: before acting, state what you are about to do and wait for the user to ` +
-      'agree; only then call this tool. The exception is action "list", which changes nothing and ' +
-      'may be called straight away.'
+      `${base} Before acting, state your plan and wait for the user to agree; \`list\` alone can ` +
+      'be called directly.'
     )
   }
-  return `${base} The user has turned confirmation off, so act on the request directly.`
+  return `${base} The user has turned confirmation off — act directly.`
 }
 
 /**
@@ -262,24 +253,19 @@ export function sessionToolDescription(requireConfirmation: boolean): string {
  * @returns The description to register.
  */
 export function modelToolDescription(): string {
+  /*
+   * Short like the session tool's, for the same per-request reason, and with the same announcement
+   * rule: the channel has already told the user what happened, so a second, looser telling can only
+   * contradict it. The next-turn sentence is the one that stops the agent describing a switch as
+   * applied to the work already running.
+   */
   return (
-    'Choose which model this WeChat conversation runs on, and at which reasoning level, and show ' +
-    'which models and levels are available. Call ' +
-    'this whenever the user asks to see the models, or to change the one in use — in any wording, ' +
-    'such as "换个模型" or "切到 X" — and whenever they ask about how hard it thinks, in any wording ' +
-    'such as "推理等级"、"思考等级"、"thinking level"、"调高一点" or "换成 high". Do not merely ' +
-    'describe these actions in a reply; call the tool. ' +
-    'The user is on a phone and cannot see the desktop model picker. ' +
-    // Switching does not move the conversation, so unlike the session tool the caller is not at
-    // risk of answering from somewhere else — but the announcement rule is the same, because the
-    // channel has already told the user what happened and a second, looser telling can only
-    // contradict it.
-    'Both listing and switching are announced to the user by the channel, including when they fail, ' +
-    'so do not repeat that outcome either way. Never tell the user a model or level switch succeeded; ' +
-    'read ' +
-    'the result\'s `ok` field and, if it is false, say nothing about it because the channel has ' +
-    'already told them what went wrong. ' +
-    'A switch applies to the conversation the caller is bound to, and takes effect from the next turn.'
+    'Choose this WeChat conversation\'s model and reasoning level, and list what is available. ' +
+    'Call this whenever the user asks to see or change either — e.g. "换个模型", "推理等级", ' +
+    '"thinking level" — never just describe it. ' +
+    'The channel announces listing and switching, failures included: do not repeat it, never ' +
+    'claim a model/level switch succeeded, and say nothing if `ok` is false. ' +
+    'A switch applies to the caller\'s bound conversation from the next turn.'
   )
 }
 
@@ -2222,7 +2208,10 @@ class WechatRuntime {
     const send = tools.register({
       name: 'send_to_wechat',
       description:
-        'Send a file from this machine to the WeChat conversation that asked for it. Images arrive as photos, videos as playable clips, and everything else as a file attachment, chosen from the path extension. Use this whenever the user asked to see, receive, or be sent a file, image, screenshot, chart, or video. The path must be absolute and may point anywhere on this machine — a file on the Desktop or in a project folder is sent as it is, with no need to copy it anywhere first.',
+        'Send a file from this machine to the WeChat conversation that asked for it — for any ' +
+        'file, image, video, or screenshot the user wants. Images arrive as photos, videos as ' +
+        'playable clips, everything else as a file attachment. The path must be absolute and may ' +
+        'be anywhere on this machine; no copy needed.',
       parameters: {
         type: 'object',
         properties: {
@@ -2278,7 +2267,14 @@ class WechatRuntime {
     const notify = tools.register({
       name: 'notify_wechat',
       description:
-        'Push a message, and optionally a file, to the user\'s WeChat. Unlike send_to_wechat this works from any session, including one the WeChat conversation is not currently bound to, which is what makes "tell me when it is done" possible. Always reaches the conversation the user is currently in; there is no way to choose another. Use it to report a finished task, or to send a file the user asked to receive. **WeChat allows only ten messages per reply window, and the window reopens only when the user writes: after ten, everything else waits for their next message.** So when you have several things to say, say them in one message as a list rather than as several messages - each separate message spends one of the ten. **Send through this tool even for a timed series - one call per message - because only then can the plugin count the window, warn the user before the ten run out, and queue whatever the window refuses. A script that calls the API directly gets none of that: the plugin never sees those sends, cannot warn, and the eleventh message is refused and lost.** **When a script has to do the sending - a timed loop, a countdown, anything that runs outside this turn - have it run the `dsh-wechat-send "<text>"` command instead of talking to the iLink API itself; add `--file <path>` to attach a file, and `--help` for the exit codes. That command counts the same window as this tool, warns the user at the same point, and queues what the window refuses. Reaching the API directly is the one thing that loses messages.** Keep text short — it is read on a phone.',
+        'Push a message, and optionally a file, to the user\'s WeChat from any session, even ' +
+        'unbound, always to their current conversation; no target can be chosen. Use it for ' +
+        'finished work or a requested file. Only ten messages fit per reply window; it reopens ' +
+        'only when the user writes, and the rest wait for their next message — so send several ' +
+        'things as one message, not several, since each costs a slot. Use this tool even for a ' +
+        'timed series, one call per message; a script must run `dsh-wechat-send`, never the iLink ' +
+        'API — only plugin sends count, warn and queue, so direct calls lose messages. Keep it ' +
+        'short for a phone.',
       parameters: {
         type: 'object',
         properties: {
