@@ -999,6 +999,15 @@ export class SessionRouter {
           browse: position,
         }
       }
+      if (resolution.kind === 'unprinted') {
+        // Answered rather than handed to the agent, and the position is kept: a number that named no
+        // workspace is still a step inside the folder list, not a message to anyone.
+        return {
+          kind: 'reply',
+          text: unprintedFolderMessage(resolution.number, resolution.count),
+          browse: position,
+        }
+      }
       if (resolution.kind === 'none') return undefined
 
       const folder = resolution.folder
@@ -1055,6 +1064,9 @@ export class SessionRouter {
     return await this.#switchTo(params, text, {
       mode: 'reply',
       fallback: screenRows(rows, position.page),
+      // The walk continues if this turn answers "that number is not on this screen": the user is
+      // still reading it, so 「查看其余」 has to go on from here.
+      browse: position,
     })
   }
 
@@ -1066,15 +1078,19 @@ export class SessionRouter {
    *
    * @param params - The routing parameters.
    * @param args - What the user typed or replied with.
-   * @param options.mode - `command` answers a failure with guidance; `reply` returns nothing instead,
-   *   so a message that merely failed to name a conversation still reaches the agent.
+   * @param options.mode - `command` answers every failure with guidance; `reply` returns nothing for
+   *   `none` and `ambiguous`, so a message that merely failed to name a conversation still reaches the
+   *   agent. A number that named no row is answered in both modes — see the branch below.
    * @param options.fallback - Numbering to read a number against when the caller has no frozen one.
+   * @param options.browse - Where the reply leaves the conversation in the browser, for the one
+   *   failure that does not end the walk: a number the screen never printed. Kept because the user is
+   *   still reading that screen, so the next 「查看其余」 has to continue it rather than start over.
    * @returns The confirmation, or undefined when nothing resolved and the caller asked to stay quiet.
    */
   async #switchTo(
     params: { conversationId: string; accountId: string; peerId: string; numbered?: NumberedRows },
     args: string,
-    options: { mode: 'command' | 'reply'; fallback?: NumberedRows },
+    options: { mode: 'command' | 'reply'; fallback?: NumberedRows; browse?: BrowsePosition },
   ): Promise<RouteResult | undefined> {
     /*
      * A number is read against the listing the user was shown, never re-derived from live sessions.
@@ -1109,6 +1125,19 @@ export class SessionRouter {
     }
     const searchable = [...known.values()]
     const resolution = resolveTarget(args, searchable, pool)
+    if (resolution.kind === 'unprinted') {
+      /*
+       * Answered in both modes, unlike `none`: a number is a step in a listing, so handing it to the
+       * agent would turn "I picked a row you never printed" into a prompt whose text is "14". The
+       * screen's own range is what makes the answer actionable, and the caller's position rides along
+       * so the user can carry on reading.
+       */
+      return {
+        kind: 'reply',
+        text: unprintedTargetMessage(resolution.number, resolution.first, resolution.last),
+        ...(options.browse === undefined ? {} : { browse: options.browse }),
+      }
+    }
     if (resolution.kind === 'ambiguous') {
       if (options.mode === 'reply') return undefined
       return { kind: 'reply', text: ambiguousTargetMessage(args.trim(), resolution.candidates) }
@@ -1219,6 +1248,14 @@ function replacedBindingNotice(
 export type TargetResolution =
   | { kind: 'found'; session: NumberedSession }
   | { kind: 'ambiguous'; candidates: NumberedSession[] }
+  /**
+   * A number that named no row of the listing the user was shown.
+   *
+   * Its own outcome because the answer has to say *which numbers do exist* — "no such conversation"
+   * would send the user back to the list for a reading they already have. And because this is the
+   * case that must never be rescued by a looser reading: see {@link resolveTarget}.
+   */
+  | { kind: 'unprinted'; number: number; first: number; last: number }
   | { kind: 'none' }
 
 /**
@@ -1235,6 +1272,23 @@ export type TargetResolution =
  *
  * Order matters: the exact readings are tried before the prefix reading, so a conversation whose
  * title looks like a hex fragment is still reachable by that title.
+ *
+ * **A number is a row of the listing, never a fragment of an identifier.** It used to fall through to
+ * the id and title readings when no row carried it, and that fall-through is what produced three
+ * flaky tests and blocked a release: `99` and `14` are legal hex prefixes, so a session whose
+ * six-character id happened to begin with either made `/switch` *succeed* where the caller required
+ * it to fail. The auto-generated title repeats those same six characters (`微信 14c71a`), so the
+ * loose title reading could have rescued the number even if the prefix reading had been removed —
+ * which is why patching one reading at a time never held. A number that names no row is answered with
+ * `unprinted` (the row range it could have named) instead of being reinterpreted: ambiguity has to
+ * fail out loud, because a guess moves the user's conversation somewhere they never asked to be.
+ * Refusing costs nothing a number could still deliver, because every conversation is a row of some
+ * listing.
+ *
+ * The one thing a number may still name is the **exact** short id the row prints, six characters and
+ * no more — otherwise a row whose id happens to be all digits (`123456`, about one in seventeen)
+ * could not be typed as the id the listing tells the user to type. That is an exact identifier, not a
+ * prefix match, and it is tried only when no row carries the number.
  *
  * @param args - What the user typed after `/switch`.
  * @param sessions - Every session that may be named, usually the whole machine.
@@ -1262,12 +1316,40 @@ export function resolveTarget(
     const byIndex = index < 0 ? undefined : numbered.sessions[index]
     if (byIndex !== undefined) return { kind: 'found', session: byIndex }
     /*
-     * Fall through: a numeric string can still be a title or an id.
+     * Nothing on this screen carries that number. The listing prints one other form, though, and a
+     * number is a legal hex string: a row whose short id is six digits (`123456`) would otherwise
+     * stop working when typed exactly as printed — about one row in seventeen, and that row may not
+     * be on the screen the user has in hand.
      *
-     * A number *below* the screen's first one is not silently folded onto row 1 — numbering runs on,
-     * so "3" on a screen that starts at 11 is a number from a screen the user has scrolled past, and
-     * guessing which row they meant is exactly the drift the pin exists to prevent.
+     * So the *exact* printed short id is still read, and it is the only thing that is: not a prefix
+     * of one (`14` must never find `14c71a`, which is the third incident), not a longer numeric
+     * prefix, not a title. That is an exact identifier the row itself prints, not a guess between
+     * candidates; several sessions can share one, and then the answer is the same "your id is too
+     * short" it is for any other collision.
      */
+    if (value.length === SHORT_ID_LENGTH) {
+      const exactShort = sessions.filter(
+        (session) => shortId(session.sessionId).toLowerCase() === value.toLowerCase(),
+      )
+      if (exactShort.length === 1) return { kind: 'found', session: exactShort[0] }
+      if (exactShort.length > 1) return { kind: 'ambiguous', candidates: exactShort }
+    }
+    /*
+     * Anything else is refused, deliberately *not* a fall-through to the id and title readings, which
+     * is the bug this function was rebuilt around: a number that names no row is ambiguous between a
+     * row of a screen the user is not looking at and some identifier, and reinterpreting it moves
+     * their conversation somewhere they never asked to be. A number *below* the screen's first one is
+     * refused for the same reason — numbering runs on, so it belongs to a screen the user has
+     * scrolled past, and folding it onto row 1 is the drift the pin exists to prevent.
+     */
+    return numbered.sessions.length === 0
+      ? { kind: 'none' }
+      : {
+          kind: 'unprinted',
+          number: Number(value),
+          first: numbered.first,
+          last: numbered.first + numbered.sessions.length - 1,
+        }
   }
 
   const exactId = sessions.find((session) => session.sessionId === value)
@@ -1277,7 +1359,8 @@ export function resolveTarget(
   if (byTitle !== undefined) return { kind: 'found', session: byTitle }
 
   // The short id lives in the middle: `session-<short>-<uuid>`. Any prefix of it does too, which is
-  // what makes "use a longer id" an answer the user can act on.
+  // what makes "use a longer id" an answer the user can act on. Only non-numeric arguments reach
+  // here: a number was answered above, one way or the other.
   if (/^[0-9a-f]+$/i.test(value)) {
     const lower = value.toLowerCase()
     const byPrefix = sessions.filter((session) => idKeyOf(session.sessionId).startsWith(lower))
@@ -1308,6 +1391,34 @@ export function resolveTarget(
   if (byCore.length === 1) return { kind: 'found', session: byCore[0] }
 
   return { kind: 'none' }
+}
+
+/**
+ * The answer to a number that named no row of the screen the user was shown.
+ *
+ * The first line is the whole explanation, because the channel quotes only that line back when this
+ * answer travels through the tool: a failure announced without the range would leave the user typing
+ * numbers at a screen that cannot answer them. It opens with `找不到` for a second, unrelated reason:
+ * the host decides whether a spoken switch succeeded by that word, so an answer that named no
+ * conversation has to keep saying so. The tail offers the other form the row prints — which does work
+ * for any six characters, including an all-digit one, because that is read as the exact id when no
+ * row carries the number.
+ *
+ * @param value - The number the user typed.
+ * @param first - Number printed beside the screen's first row.
+ * @param last - Number printed beside its last row.
+ * @returns The message body.
+ */
+export function unprintedTargetMessage(value: number, first: number, last: number): string {
+  const range = `${String(first)}–${String(last)}`
+  const where =
+    value < first
+      ? `这一屏是 ${range}（编号跨屏连续）`
+      : `这一屏只有 ${String(last - first + 1)} 项（${range}）`
+  return [
+    `找不到编号 ${String(value)}：${where}。`,
+    '要用 id 请回行尾那 6 位；回复 /list 能再看一次清单。',
+  ].join('\n')
 }
 
 /**
@@ -1407,7 +1518,8 @@ export function workspaceLabel(path: string): string {
  *
  * Accepts a 1-based list position, a model id, or a model name — the same three shapes `/switch`
  * accepts for a conversation, for the same reason: the number is what the listing prints, and the
- * name is what a person remembers.
+ * name is what a person remembers. A number is only ever a position; see `resolveTarget` for the
+ * incidents that rule comes from.
  *
  * Matching is deliberately strict, and every match must be unique. Two providers can expose the same
  * model id (`deepseek-chat` from two accounts), so a loose match would silently pick one of them, and
@@ -1425,9 +1537,16 @@ export function resolveModelOption(
   if (value === '') return undefined
 
   if (/^\d+$/.test(value)) {
-    const byIndex = models[Number(value) - 1]
-    if (byIndex !== undefined) return byIndex
-    // Fall through: a numeric string can still be part of a name or an id.
+    /*
+     * A number is the row the listing printed and nothing else.
+     *
+     * It used to fall through to the names and ids, which is the same shape of guess that cost three
+     * flaky tests on `/switch` (see {@link resolveTarget}); there is no random id here, so it never
+     * bit, but the rule the user set does not have an exception for "it happens to be harmless".
+     * Nothing becomes unreachable: the list numbers every model, and the caller already answers a
+     * missing number with the instruction to look at it again.
+     */
+    return models[Number(value) - 1]
   }
 
   // Case-insensitive, unlike session titles: model ids are machine-written identifiers, and a user
@@ -1802,10 +1921,12 @@ export function renderSessionScreen(
   }
 }
 
-/** What entering a folder resolved to. Ambiguous and none are separate, as for `resolveTarget`. */
+/** What entering a folder resolved to. Ambiguous, unprinted and none are separate, as for `resolveTarget`. */
 export type FolderResolution =
   | { kind: 'found'; folder: SessionFolder }
   | { kind: 'ambiguous'; candidates: SessionFolder[] }
+  /** A number at or above which the machine has no workspace. */
+  | { kind: 'unprinted'; number: number; count: number }
   | { kind: 'none' }
 
 /**
@@ -1819,6 +1940,11 @@ export type FolderResolution =
  * name is that last component — so a name matching several folders returns the candidates instead of
  * picking one. Entering the wrong project's folder is worse than a question.
  *
+ * A pure number is a position and nothing else, exactly as in {@link resolveTarget}: it used to fall
+ * through to the names, which would enter a folder called `3` when the user meant the third row (or
+ * the reverse). The two readings are the same ambiguity that cost three flaky tests on the session
+ * side of this browser, and a number out of range says how many there are instead of guessing.
+ *
  * @param args - What the user replied with.
  * @param folders - Every folder, in the order the listing numbered them.
  * @returns What it named.
@@ -1830,7 +1956,7 @@ export function resolveFolder(args: string, folders: readonly SessionFolder[]): 
   if (/^\d+$/.test(value)) {
     const byIndex = folders[Number(value) - 1]
     if (byIndex !== undefined) return { kind: 'found', folder: byIndex }
-    // Fall through: a numeric string can still be a folder name.
+    return { kind: 'unprinted', number: Number(value), count: folders.length }
   }
 
   const byLabel = folders.filter((folder) => folder.label === value)
@@ -1847,6 +1973,28 @@ export function resolveFolder(args: string, folders: readonly SessionFolder[]): 
   if (byCore.length > 1) return { kind: 'ambiguous', candidates: byCore }
 
   return { kind: 'none' }
+}
+
+/**
+ * The answer to a folder number this machine has no workspace at.
+ *
+ * Same shape as {@link unprintedTargetMessage}, for the same reason: the user is looking at a list
+ * that printed numbers, so the useful reply is how many it printed. Folders are numbered across the
+ * whole list rather than one screen at a time (they are a short list), so there is no screen to name.
+ *
+ * @param value - The number the user replied with.
+ * @param count - Workspaces on this machine.
+ * @returns The message body.
+ */
+export function unprintedFolderMessage(value: number, count: number): string {
+  // Unreachable from the browser (it only opens a list that has a folder on it), and answered rather
+  // than left to produce "1–0" if a future caller reaches it.
+  if (count <= 0) return `找不到编号 ${String(value)}：这台机器还没有会话夹。发 /list all 看一眼。`
+  const range = `1–${String(count)}`
+  return [
+    `找不到编号 ${String(value)}：会话夹只有 ${String(count)} 个（${range}）。`,
+    `回复 ${range} 的编号，或直接回复名字。`,
+  ].join('\n')
 }
 
 /**

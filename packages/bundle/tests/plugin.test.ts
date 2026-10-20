@@ -31,6 +31,9 @@ import {
   isSameWorkspace,
   shortId,
 } from '@dsh-wechat/core'
+// The helper lives with core's tests, next to the resolver whose readings it has to satisfy, and is
+// shared so a second copy cannot drift into being the less careful one.
+import { unmatchedSwitchTarget } from '../../core/tests/support.ts'
 
 /**
  * Note on the core import: `host.ts` imports `@dsh-wechat/core`, which resolves
@@ -1781,15 +1784,18 @@ test('a failed switch tells the user, because the agent may claim it worked', as
     const before = harness.sent.length
 
     /*
-     * A target no session can carry — deliberately not the `99` this used to send.
+     * The target is generated rather than remembered, and that is the point.
      *
-     * `99` is a legal hex prefix, so on a run where a session's short id happened to begin with
-     * those two digits the switch *succeeded*, `ok` came back true, and this test failed for a
-     * reason that had nothing to do with the behaviour it checks: roughly one run in 256. A target
-     * containing a character outside the hex alphabet cannot match an id at all, so the failure
-     * path is reached on every run instead of on most of them.
+     * This sent `99` for a long time, and `99` is a legal hex prefix: on the run where the
+     * conversation's new session had a short id beginning with those digits, the switch *succeeded*,
+     * `ok` came back true, and the test failed for a reason that had nothing to do with what it
+     * checks — about one run in 256. It was then changed to `zzzzzzz`, which fixed that run and not
+     * the class: the resolver was still free to reinterpret a numeric target, and the third incident
+     * was exactly that. The helper names nothing on purpose (its own test in `core.test.ts` proves it
+     * against a hostile machine), so this failure path is reached on every run.
      */
-    const missed = await control(harness, 'switch', 'zzzzzzz')
+    const target = unmatchedSwitchTarget()
+    const missed = await control(harness, 'switch', target)
     assert.equal(missed.ok, false)
 
     /*
@@ -1801,7 +1807,7 @@ test('a failed switch tells the user, because the agent may claim it worked', as
     assert.equal(harness.sent.length, before + 1, 'the failure is announced')
     const body = harness.sent.at(-1)?.text ?? ''
     assert.match(body, /没有成功/)
-    assert.match(body, /zzzzzzz/, 'the message names what was asked for')
+    assert.ok(body.includes(target), `the message names what was asked for: ${body}`)
     // And how to succeed instead.
     assert.match(body, /\/list/)
   })
@@ -2180,10 +2186,17 @@ test('a quoted spoken listing answers with the rows that message printed', async
   /*
    * The numbering is frozen under the id the service assigns to the message that printed it, so a
    * quote of that message resolves the numbers the user can see. Paging makes this sharper rather
-   * than weaker: numbering runs on across screens, so a screen that printed 11..13 must answer "13"
+   * than weaker: numbering runs on across screens, so a screen that printed 11..14 must answer "14"
    * with its own row — and the screen before it, which stopped at 10, must not answer that number at
    * all. The two are asserted against each other, because a test where they agreed would pass with
    * the offset missing.
+   *
+   * The oldest conversation's short id deliberately begins with `14`: that is the third incident in
+   * this repository's history. `14` is a legal hex prefix, so a resolver that fell back to "an id
+   * beginning with those digits" answered this number on the first screen as well — and on the run
+   * where a session's random id happened to start with it, a switch that was required to fail
+   * succeeded. Here the id is not random, so a regression fails this test on every run instead of
+   * one run in 256.
    */
   const home = await mkdtemp(join(tmpdir(), 'dsh-wechat-test-'))
   try {
@@ -2191,42 +2204,19 @@ test('a quoted spoken listing answers with the rows that message printed', async
     const workspace = join(home, 'dsh_wechat')
     const ids: string[] = []
     for (let index = 0; index < 13; index += 1) {
-      const id = `session-${String(index).padStart(4, '0')}aaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`
+      // The oldest carries the id that a first-screen "14" must not be allowed to become.
+      const hex = index === 0 ? '14aaaa00' : `${String(index).padStart(4, '0')}aaaa`
+      const id = `session-${hex}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`
       ids.push(id)
       // Oldest first, so the newest is row 1 and the oldest is row 13.
       await seedStoredSession(home, workspace, id, `本工作区 ${String(index)}`)
     }
     const oldest = ids[0] ?? ''
+    assert.equal(shortId(oldest), '14aaaa', 'the fixture has to carry the id the number could name')
 
     const harness = await mount({ home, seedAccount: false, hostReportsNoSessions: true })
     try {
       await harness.runtime.ingest(inbound('第一条'))
-
-      /*
-       * Pick a number the first screen never printed, for the offset assertion below.
-       *
-       * A numeric target that misses the pinned screen falls through to the ordinary id/title
-       * match in `resolveTarget`. If the session this first message just created happens to have a
-       * short id starting with the number, that switch really succeeds — the same 1/256 flake the
-       * handbook records for `/switch 99`. So choose a number no live id can match instead of
-       * betting on the random session id.
-       */
-      const liveIds = [
-        ...ids,
-        ...harness.created.flatMap((entry) =>
-          entry.sessionId === undefined ? [] : [entry.sessionId],
-        ),
-        ...harness.prompted.map((entry) => entry.sessionId),
-      ]
-      const idKeys = liveIds.map((id) =>
-        (/^session-([0-9a-f]+)-/i.exec(id)?.[1] ?? id).toLowerCase(),
-      )
-      const unprinted = Array.from({ length: 86 }, (_, index) => index + 14).find(
-        (candidate) =>
-          !idKeys.some((key) => key.startsWith(String(candidate))) &&
-          !liveIds.some((id) => id.toLowerCase().endsWith(String(candidate))),
-      )
-      assert.ok(unprinted !== undefined, 'a number no live session id can match')
 
       const listed = await control(harness, 'list')
       assert.equal(listed.ok, true, listed.detail)
@@ -2248,17 +2238,25 @@ test('a quoted spoken listing answers with the rows that message printed', async
       assert.match(harness.sent.at(-1)?.text ?? '', /已切换到「本工作区 0」/)
       assert.equal((await harness.runtime.bindings())[0]?.sessionId, oldest)
 
-      // And the first screen, which never printed that number, does not answer it: the offset is
-      // what makes the same text mean the row on the screen it was typed against. Row 1 is a
-      // different conversation, so "nothing moved" is a real assertion rather than the binding
-      // already being the one under test.
+      // Row 1 of the first screen is a different conversation, so the "moved nothing" assertion
+      // below is about the refusal rather than about the binding already being the one under test.
       await harness.runtime.ingest(quoting('/switch 1', pageOneId))
       const afterFirst = (await harness.runtime.bindings())[0]?.sessionId
       assert.ok(afterFirst)
       assert.notEqual(afterFirst, oldest, 'row 1 of the first screen is a different conversation')
 
-      await harness.runtime.ingest(quoting(`/switch ${String(unprinted)}`, pageOneId))
-      assert.match(harness.sent.at(-1)?.text ?? '', /找不到这个对话/)
+      /*
+       * The same `14`, quoted against the screen that stopped at 10, is refused out loud.
+       *
+       * Every earlier version of this test had to *search* for a number no live session id could
+       * match, which is how the flake was dodged rather than fixed. Now the number is refused
+       * because no row on that screen carries it, whatever ids exist — so the test can say the one
+       * thing the user reads: which numbers that screen did carry.
+       */
+      await harness.runtime.ingest(quoting('/switch 14', pageOneId))
+      const refused = harness.sent.at(-1)?.text ?? ''
+      assert.match(refused, /找不到编号 14/)
+      assert.match(refused, /这一屏只有 10 项（1–10）/)
       assert.equal(
         (await harness.runtime.bindings())[0]?.sessionId,
         afterFirst,
@@ -2544,18 +2542,51 @@ test('a switch to something unknown reports failure instead of a phantom move', 
     await harness.runtime.ingest(inbound('第一条'))
 
     /*
-     * The same target the typed command is checked with, and for the same reason: `99` is a legal hex
-     * prefix, so on a run where a session's id happened to begin with those two digits the switch
-     * *succeeded* and this test failed for a reason that has nothing to do with what it checks —
-     * which is exactly what a CI run reported here (`ok` came back true). A character outside the hex
-     * alphabet cannot match an id at all, so the failure path is reached on every run instead of on
+     * The same generated target the typed command is checked with, and for the same reason: `99` was
+     * a legal hex prefix, so on a run where the new session's id began with those two digits the
+     * switch *succeeded* and `ok` came back true — which is exactly what a CI run reported here.
+     * The helper cannot name anything, so the failure path is reached on every run instead of on
      * about 255 of every 256.
      */
-    const missed = await control(harness, 'switch', 'zzzzzzz')
+    const missed = await control(harness, 'switch', unmatchedSwitchTarget())
     // The command answers with guidance rather than throwing, so the result has to be read rather
     // than assumed — otherwise the agent tells the user it switched when nothing happened.
     assert.equal(missed.ok, false)
     assert.match(missed.detail, /找不到/)
+  })
+})
+
+test('a spoken switch to a number the screen never printed is a failure, not a phantom move', async () => {
+  /*
+   * A number is the case that used to *succeed* at random: the target missed the shown screen, the
+   * resolver fell through, and a session whose short id began with those digits became the target.
+   * The tool then reported success and the channel announced a move — the exact thing the failure
+   * announcement exists to prevent.
+   *
+   * The channel recognises a failed switch by the router's own words (there is no separate flag on a
+   * reply), so this also pins that an answer which named no conversation keeps saying `找不到`. If a
+   * future reword dropped it, the tool would return `ok: true` here and the assertion below would
+   * catch the phantom success rather than the wording.
+   */
+  await withSettings(async (harness) => {
+    await harness.runtime.ingest(inbound('第一条'))
+    const listed = await control(harness, 'list')
+    assert.equal(listed.ok, true, listed.detail)
+    const bound = (await harness.runtime.bindings())[0]?.sessionId
+    assert.ok(bound)
+
+    // The listing this conversation just received printed one row, so 9 names nothing at all. After
+    // the fix a number is never read as an id, so no random session can rescue it — this used to be
+    // a 1-in-256 bet, which is why the literal is a number *this screen cannot have* rather than one
+    // no live id was expected to match.
+    const missed = await control(harness, 'switch', '9')
+    assert.equal(missed.ok, false, `a number with no row must fail: ${missed.detail}`)
+    assert.match(missed.detail, /切换失败/)
+    const body = harness.sent.at(-1)?.text ?? ''
+    assert.match(body, /没有成功/)
+    assert.match(body, /找不到编号 9/)
+    assert.match(body, /这一屏只有 1 项（1–1）/)
+    assert.equal((await harness.runtime.bindings())[0]?.sessionId, bound, 'and nothing moved')
   })
 })
 

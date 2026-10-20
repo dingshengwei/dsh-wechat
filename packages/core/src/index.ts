@@ -53,6 +53,8 @@ export {
   sessionFolders,
   shortId,
   splitCommand,
+  unprintedFolderMessage,
+  unprintedTargetMessage,
   workspaceLabel,
   HELP_TEXT,
   type BindingStore,

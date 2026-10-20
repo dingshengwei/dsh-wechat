@@ -34,16 +34,20 @@ import {
   renderSessionScreen,
   resolveFolder,
   resolveLevel,
+  resolveModelOption,
   resolveTarget,
   sessionFolders,
   shortId,
   splitCommand,
+  unprintedFolderMessage,
+  unprintedTargetMessage,
   HELP_TEXT,
 } from '../src/router.ts'
 import type { BrowsePosition, ListedSession, ModelListing, ModelOption, ModelSelection, NumberedRows, NumberedSession, SessionBinding, SessionFolder, SessionGateway, SessionState, TargetResolution } from '../src/router.ts'
 import type { ChannelState } from '../src/state.ts'
 import { chargeQuota, quotaLedgerFor, type QuotaEntry } from '../src/quota.ts'
 import type { WeixinAccount, WeixinMessage } from '../src/types.ts'
+import { unmatchedSwitchTarget } from './support.ts'
 
 /** A state with nothing in it, for exercising the queue helpers. */
 function emptyState(): ChannelState {
@@ -791,6 +795,92 @@ test('entering a workspace works by number and by name, and does not move the bi
   assert.equal(unmatched.kind, 'prompt')
 })
 
+test('a folder number this machine does not have is answered, and the walk continues', async () => {
+  /*
+   * A number in the folder list is a position, not a name. This used to fall through to the labels,
+   * so a workspace whose directory is called `9` answered "9" even when there was no ninth folder —
+   * the same shape of guess that cost three flaky tests one level down (`resolveTarget`). The
+   * fixture makes the difference deterministic: without the rule, this test switches folders instead
+   * of saying so.
+   */
+  const gateway = new FakeGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  await router.route({ ...conversation, text: '第一条' })
+  gateway.foreign.push(
+    {
+      sessionId: 'session-9999aaaa-9999aaaa-x',
+      title: '九号项目的活',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\9',
+    },
+    {
+      sessionId: 'session-ffff9999-ffff9999-x',
+      title: '别处的工作',
+      updatedAt: gateway.nextStamp(),
+      workspace: 'C:\\Users\\me\\some_project',
+    },
+  )
+
+  const browser = browsing(router)
+  const folders = await browser.say('/list all')
+  assert.equal(folders.kind, 'reply')
+  if (folders.kind !== 'reply') return
+  assert.equal(screenRows(folders.text).length, 3, `three workspaces:\n${folders.text}`)
+
+  const refused = await browser.say('9')
+  assert.equal(refused.kind, 'reply')
+  if (refused.kind !== 'reply') return
+  assert.match(refused.text, /找不到编号 9：会话夹只有 3 个（1–3）/)
+  // Still standing in the folder list, so the next number is read at that level — a refusal is not
+  // the end of the walk.
+  assert.equal(refused.browse?.level, 'folders')
+  const entered = await browser.say('2')
+  assert.equal(entered.kind, 'reply')
+  if (entered.kind !== 'reply') return
+  assert.match(entered.text, /【some_project】会话（1\/1）/, 'row 2 is a real folder and still opens')
+})
+
+test('a conversation number the screen never printed is answered, and the walk continues', async () => {
+  /*
+   * The same rule at the conversation level, and the hostile part matters: another conversation in
+   * this workspace has a short id beginning with the number used below. The old resolver answered "5"
+   * with that session — the third incident's shape (`/switch 14` finding `14c71a`) — so this test
+   * fails on every run without the fix, instead of once in 256.
+   */
+  const gateway = new FakeGateway()
+  const router = new SessionRouter({ gateway, store: memoryStore() })
+  const home = await router.route({ ...conversation, text: '第一条' })
+  assert.equal(home.kind, 'prompt')
+  if (home.kind !== 'prompt') return
+  gateway.sessions.push({
+    sessionId: 'session-5aaa0000-5aaa0000-4aaa-8aaa-aaaaaaaaaaaa',
+    title: '另一件事',
+    updatedAt: gateway.nextStamp(),
+  })
+
+  const browser = browsing(router)
+  const listed = await browser.say('/list')
+  assert.equal(listed.kind, 'reply')
+  if (listed.kind !== 'reply') return
+  assert.equal(screenRows(listed.text).length, 2)
+
+  const refused = await browser.say('5')
+  assert.equal(refused.kind, 'reply')
+  if (refused.kind !== 'reply') return
+  assert.match(refused.text, /找不到编号 5：这一屏只有 2 项（1–2）/)
+  assert.equal(refused.browse?.level, 'sessions')
+  assert.equal(
+    (await router.current(conversation.conversationId))?.sessionId,
+    home.decision.sessionId,
+    'and nothing moved',
+  )
+  // The position survived the refusal: the next 「查看其余」 answers as a continuing walk would.
+  const rest = await browser.say(SHOW_REST)
+  assert.equal(rest.kind, 'reply')
+  if (rest.kind !== 'reply') return
+  assert.match(rest.text, /只有 1 页，已经到底了/)
+})
+
 test('two workspaces with the same folder name are not guessed between', async () => {
   /*
    * Two projects can both end in `workplace`, and the name printed is the last path component — so a
@@ -908,14 +998,44 @@ test('a number on a later screen is read with that screen’s offset', () => {
     })),
     first: 11,
   }
+  /*
+   * The two extra conversations are this test's teeth.
+   *
+   * Their short ids begin with the very numbers the assertions below say were never printed, and
+   * their titles repeat those digits. The resolver used to fall through to "an id that starts with
+   * those digits" when no row carried the number, so with a machine like this it answered "3" and
+   * "25" with a conversation the screen never showed — which is exactly the failure that used to
+   * arrive by chance, once in 256 runs, whenever a random id happened to begin with the number a
+   * test had written. Here it would be deterministic, so a regression cannot pass quietly.
+   */
+  const machine = [
+    ...rows.sessions,
+    { sessionId: 'session-3aaa0000-3aaa0000-4aaa-8aaa-aaaaaaaaaaaa', title: '会话 三号 3' },
+    { sessionId: 'session-25bb0000-25bb0000-4aaa-8aaa-aaaaaaaaaaaa', title: '会话 二五 25' },
+  ]
 
-  assert.equal(found(resolveTarget('13', rows.sessions, rows))?.title, '会话 丙')
-  assert.equal(found(resolveTarget('11', rows.sessions, rows))?.title, '会话 甲')
-  assert.equal(found(resolveTarget('20', rows.sessions, rows))?.title, '会话 癸')
+  assert.equal(found(resolveTarget('13', machine, rows))?.title, '会话 丙')
+  assert.equal(found(resolveTarget('11', machine, rows))?.title, '会话 甲')
+  assert.equal(found(resolveTarget('20', machine, rows))?.title, '会话 癸')
   // A number from a screen the user has scrolled past is not folded onto row 1: guessing which row
-  // they meant is the one thing a pinned numbering must never do.
-  assert.equal(resolveTarget('3', rows.sessions, rows).kind, 'none')
-  assert.equal(resolveTarget('25', rows.sessions, rows).kind, 'none')
+  // they meant is the one thing a pinned numbering must never do. Nor is it read as an id.
+  const below = resolveTarget('3', machine, rows)
+  assert.equal(below.kind, 'unprinted')
+  if (below.kind === 'unprinted') {
+    assert.deepEqual(
+      { number: below.number, first: below.first, last: below.last },
+      { number: 3, first: 11, last: 20 },
+    )
+  }
+  // And a number past the screen's last row is refused for the same reason, even though an id and a
+  // title both begin with it.
+  const above = resolveTarget('25', machine, rows)
+  assert.equal(above.kind, 'unprinted')
+  if (above.kind !== 'unprinted') return
+  const message = unprintedTargetMessage(above.number, above.first, above.last)
+  assert.match(message, /找不到编号 25/, 'the answer names the number that matched nothing')
+  assert.match(message, /这一屏只有 10 项（11–20）/, 'and the range it could have named')
+  assert.match(message, /行尾那 6 位/, 'and how to be unambiguous instead')
 })
 
 test('the same screen is byte-identical however the store hands the rows over', () => {
@@ -1001,7 +1121,22 @@ test('resolveFolder accepts a number and a name, and refuses to choose between t
   assert.equal(byNumber.kind, 'found')
   if (byNumber.kind !== 'found') return
   assert.equal(byNumber.folder.path, 'C:\\me\\beta\\workplace')
-  assert.equal(resolveFolder('9', folders).kind, 'none')
+  /*
+   * A number past the last workspace says how many there are instead of being read as a name. The
+   * extra folder below is named `9`, which is exactly the guess this used to make: it has a number of
+   * its own (5), and "9" is a position first.
+   */
+  const named9: SessionFolder[] = [...folders, { path: 'C:\\me\\9', label: '9', count: 1 }]
+  const missing = resolveFolder('9', folders)
+  assert.equal(missing.kind, 'unprinted')
+  if (missing.kind === 'unprinted') {
+    assert.deepEqual({ number: missing.number, count: missing.count }, { number: 9, count: 4 })
+    assert.match(unprintedFolderMessage(missing.number, missing.count), /会话夹只有 4 个（1–4）/)
+  }
+  assert.equal(resolveFolder('9', named9).kind, 'unprinted', 'a folder named 9 does not answer "9"')
+  const fifth = resolveFolder('5', named9)
+  assert.equal(fifth.kind, 'found')
+  if (fifth.kind === 'found') assert.equal(fifth.folder.path, 'C:\\me\\9', 'the number reaches it')
   // A name that names one folder is enough, in either direction of slop.
   assert.equal(resolveFolder('dsh_orb', folders).kind, 'found')
   assert.equal(resolveFolder('dsh', folders).kind, 'found')
@@ -1613,10 +1748,90 @@ test('resolveTarget accepts an index, a full id, the short id, and a title', () 
   assert.equal(found(resolveTarget(shortId(second), sessions))?.title, '乙')
   assert.equal(found(resolveTarget('甲', sessions))?.title, '甲')
   assert.equal(resolveTarget('', sessions).kind, 'none')
-  assert.equal(resolveTarget('9', sessions).kind, 'none')
+  // A number with no row behind it says so; it is not rescued by an id or a title (next test).
+  assert.equal(resolveTarget('9', sessions).kind, 'unprinted')
   // A suffix shared by several sessions is ambiguous and must not guess.
   assert.equal(resolveTarget('4444-555566667777', sessions).kind, 'ambiguous')
   assert.equal(resolveTarget('session-', sessions).kind, 'none')
+})
+
+test('a number that names no row is never read as an id or a title', () => {
+  /*
+   * The three incidents, as one fixture.
+   *
+   * `/switch 99` and `/switch 14` were written as "must fail" targets — and 99 and 14 are legal hex
+   * prefixes. A short id is six random hex digits, so about one run in 256 a session's id began with
+   * the digits the test had written, the switch the test required to fail *succeeded*, and the
+   * failure read as a flake. The auto-generated title repeats those digits (`微信 14c71a`), so the
+   * title reading could have rescued them even after the prefix reading had been patched — which is
+   * why patching one entrance at a time never held.
+   *
+   * The rule now: a number is a row of the listing and nothing else. This machine is hostile by
+   * construction — an id *and* a title carrying the digits, both reachable by every other reading.
+   */
+  const incident = 'session-14c71a00-14c71a00-4aaa-8aaa-aaaaaaaaaaaa'
+  const machine = [
+    row('session-aaaa0000-aaaa0000-4aaa-8aaa-aaaaaaaaaaaa', '微信 aaaa00'),
+    row(incident, '微信 14c71a'),
+    // A conversation whose whole title is a number: the other reading a numeric argument used to get.
+    row('session-2024bb00-2024bb00-4aaa-8aaa-aaaaaaaaaaaa', '2024'),
+  ]
+  const screen: NumberedRows = {
+    sessions: [
+      { sessionId: 'session-aaaa0000-aaaa0000-4aaa-8aaa-aaaaaaaaaaaa', title: '微信 aaaa00' },
+    ],
+    first: 1,
+  }
+
+  // 14 is refused although `14c71a` exists and its title contains "14".
+  const miss = resolveTarget('14', machine, screen)
+  assert.equal(miss.kind, 'unprinted')
+  if (miss.kind === 'unprinted') {
+    assert.deepEqual(
+      { number: miss.number, first: miss.first, last: miss.last },
+      { number: 14, first: 1, last: 1 },
+    )
+  }
+  // 2024 is refused too, although a conversation is named exactly that. A number is not a name: the
+  // way to reach that one is its row number (every listing prints one), which is why refusing leaves
+  // nothing unreachable.
+  assert.equal(resolveTarget('2024', machine, screen).kind, 'unprinted')
+
+  // The number is not banned — it is a position, and it wins when a screen printed it.
+  const fourteenRows: NumberedRows = {
+    sessions: Array.from({ length: 14 }, (_, index) => ({
+      sessionId: `session-cccc${String(index).padStart(4, '0')}-cccc-4ccc-8ccc-cccccccccccc`,
+      title: `会话 ${String(index + 1)}`,
+    })),
+    first: 1,
+  }
+  assert.equal(found(resolveTarget('14', machine, fourteenRows))?.title, '会话 14')
+
+  /*
+   * What a number was never meant to break: the printed id still works, in both the short form the
+   * row carries and any longer prefix of it.
+   */
+  assert.equal(found(resolveTarget(shortId(incident), machine, screen))?.sessionId, incident)
+  assert.equal(found(resolveTarget('14c7', machine, screen))?.sessionId, incident)
+
+  /*
+   * And a printed id made only of digits still works — exactly, at the length the row prints.
+   *
+   * That is not the old fall-through coming back: the value has to be six characters and has to equal
+   * what the row prints, so `14` can never reach `14c71a`. Without this a row whose id happens to be
+   * `123456` (roughly one row in seventeen) could not be switched to by the very form the listing
+   * tells the user to type — a failure arriving once every seventeen runs, which is precisely the
+   * shape of flake this change exists to remove. It was found exactly that way: the first cut of this
+   * fix made an existing `/switch <printed id>` test fail about one run in seventeen.
+   */
+  const digitsId = 'session-123456ab-123456ab-4aaa-8aaa-aaaaaaaaaaaa'
+  const digitsMachine = [...machine, row(digitsId, '微信 123456')]
+  assert.equal(shortId(digitsId), '123456')
+  assert.equal(found(resolveTarget(shortId(digitsId), digitsMachine, screen))?.sessionId, digitsId)
+  // Only exactly: a shorter prefix of that same id is a number with no row behind it, and a
+  // six-digit number that is nobody's printed id is refused the same way.
+  assert.equal(resolveTarget('1234', digitsMachine, screen).kind, 'unprinted')
+  assert.equal(resolveTarget('654321', digitsMachine, screen).kind, 'unprinted')
 })
 
 test('a number answers from the shown list while a name may reach any workspace', () => {
@@ -1631,7 +1846,7 @@ test('a number answers from the shown list while a name may reach any workspace'
 
   // A number counts the rows the user saw, so with only one own session, 2 is not a shown row.
   assert.equal(found(resolveTarget('1', every, shown(mine)))?.title, '我的')
-  assert.equal(resolveTarget('2', every, shown(mine)).kind, 'none')
+  assert.equal(resolveTarget('2', every, shown(mine)).kind, 'unprinted')
   // With everything shown, 2 is the foreign session.
   assert.equal(found(resolveTarget('2', every, shown(every)))?.title, '别处的')
   // A name is searched across everything, however few rows were displayed.
@@ -1727,6 +1942,29 @@ test('shortId stays readable, stays within six characters, and round-trips', () 
   assert.ok(shortId('session-').length <= SHORT_ID_LENGTH)
 })
 
+test('the helper that names nothing really names nothing, and never the same thing twice', () => {
+  /*
+   * Every test that needs a switch to fail now asks this helper instead of writing a literal, so the
+   * helper is what stands between the suite and a fourth repeat: a literal like `99` or `14` was only
+   * *probably* safe, and probability is what failed three times. So resolve a few of its answers
+   * against a machine built to catch them: ids beginning with digits and hex run, titles carrying
+   * them, a numeric title, and the two shapes that made the old resolver loose (prefix and title).
+   */
+  const machine = [
+    row('session-12345600-12345600-4aaa-8aaa-aaaaaaaaaaaa', '微信 123456'),
+    row('session-e716f0aa-e716f0aa-4aaa-8aaa-aaaaaaaaaaaa', '会话 3'),
+    row('session-ffffffff-ffffffff-4aaa-8aaa-aaaaaaaaaaaa', '2024'),
+  ]
+  const answered = new Set<string>()
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const target = unmatchedSwitchTarget()
+    // Generated, not remembered: a fixed literal is the failure mode this replaced.
+    assert.equal(answered.has(target), false, 'each call produces a fresh target')
+    answered.add(target)
+    assert.equal(resolveTarget(target, machine, { sessions: machine.slice(0, 1), first: 1 }).kind, 'none')
+  }
+})
+
 /*
  * ---------------------------------------------------------------------------
  * Model and reasoning level
@@ -1772,6 +2010,22 @@ const MODEL_OPTIONS: readonly ModelOption[] = [
     defaultLevel: 'low',
   },
 ]
+
+test('a model number is a row of the catalog, never part of a name or an id', () => {
+  /*
+   * The same rule as `/switch`, for the same incident: a numeric argument must not be read as
+   * something it was not printed as. The catalog is short and every model is a numbered row, so
+   * refusing an out-of-range number leaves nothing unreachable — the caller answers with the list.
+   */
+  const catalog: readonly ModelOption[] = [
+    { provider: 'p', providerName: 'P', model: 'one', name: 'One' },
+    // Hostile on purpose: the number 3 is also this model's id and a word in its name.
+    { provider: 'p', providerName: 'P', model: '3', name: 'Model 3' },
+  ]
+  assert.equal(resolveModelOption('2', catalog)?.model, '3', 'the number still means row 2')
+  assert.equal(resolveModelOption('3', catalog), undefined, 'row 3 does not exist and 3 is not a name')
+  assert.equal(resolveModelOption('Model 3', catalog)?.model, '3', 'the name still works')
+})
 
 /**
  * A gateway that also offers models, which is what `/model` needs.
